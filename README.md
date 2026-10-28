@@ -1,23 +1,31 @@
 # Santander Developer Coding Test - Hacker News API
 
-A RESTful API built with ASP.NET Core that retrieves the details of the best n stories from the Hacker News API, ordered by their score in descending order.
+A high-performance RESTful API built with ASP.NET Core (.NET 8) that retrieves the details of the best $n$ stories from the Hacker News API, strictly ordered by their score in descending order.
 
 ## How to Run the Application
 
-To run the application locally, you will need the .NET 8.0 SDK installed on your machine. First, clone this repository and open your terminal. Navigate to the API project directory by executing `cd src/HackerNews.Api`. Once there, restore the dependencies and build the project using the `dotnet build` command. 
+### Option 1: Using the .NET CLI
+To run the application locally, ensure you have the .NET 8.0 SDK installed. Clone this repository, open your terminal, and navigate to the API project directory by executing `cd src/HackerNews.Api`. Restore the dependencies and build the project using `dotnet build`, then start the server by running `dotnet run`. 
 
-Finally, start the server by running `dotnet run`. You can then open your browser and navigate to the Swagger UI at `http://localhost:<PORT>/swagger` (replacing `<PORT>` with the port provided in your terminal) to test the endpoints interactively. Alternatively, you can use a tool like curl to send a GET request directly to `http://localhost:<PORT>/api/stories/best?n=10`. To run the unit tests, simply execute `dotnet test` from the root of the solution.
+Once started, open your browser and navigate to the Swagger UI at `http://localhost:<PORT>/swagger` (replacing `<PORT>` with the port shown in your terminal) to test the endpoint interactively, or send a GET request directly to `http://localhost:<PORT>/api/stories/best?n=10`. To run the unit test suite, execute `dotnet test` from the root of the solution.
 
-## Assumptions Made
+### Option 2: Using Docker
+The repository includes a multi-stage `Dockerfile` for containerized execution. From the root directory of the solution, build the image by running `docker build -t hackernews-api .` and start the container with `docker run -p 8080:8080 hackernews-api`. The API and Swagger UI will be immediately available at `http://localhost:8080/swagger`.
 
-During the development of this solution, several design decisions were made to ensure performance and accuracy. Regarding the ordering by score, the Hacker News `/v0/beststories.json` endpoint returns up to 200 IDs ordered by a proprietary algorithm rather than strictly by score. To fulfill the requirement of returning the best stories determined by their score, the API fetches the details of all available best stories concurrently, caches them, and sorts the entire batch by score descending in memory before taking the top requested amount. 
+## Assumptions & Architectural Decisions
 
-For the comment count mapping, the Hacker News API item model contains a kids array with only top-level comments and a descendants integer. I assumed that the requested comment count refers to the total number of comments in the thread, so it is mapped directly from the descendants property. Additionally, some stories on Hacker News are text posts that do not have an external URL, so for these items, the URI property is mapped to an empty string to avoid null reference issues. 
+During the development of this solution, several architectural decisions were made to guarantee both strict accuracy and ultra-low latency under heavy load.
 
-Finally, to avoid overloading the Hacker News Firebase API and prevent socket exhaustion, concurrent requests to fetch individual item details are throttled using a SemaphoreSlim, while Polly is used to provide a standard retry resilience strategy for transient HTTP errors. The caching strategy also uses concurrency locks to ensure that if the cache expires under heavy load, only a single thread will reach out to the Hacker News API to repopulate it, preventing cache stampedes.
+Regarding the ordering by score, the Hacker News `/v0/beststories.json` endpoint returns up to 200 story IDs ranked by a proprietary aging algorithm rather than strictly by score. To accurately fulfill the requirement of returning the best $n$ stories determined by their score, the API fetches the details of all 200 best stories concurrently, caches them, and sorts the entire batch by score descending in memory before returning the top $n$ requested items.
 
-## Enhancements (Given more time)
+To eliminate initial cold-start latency for users and prevent overloading the Hacker News API, a proactive background service (`CacheWarmupWorker`) warms up the cache upon application startup and refreshes it periodically in the background. Additionally, if a request arrives while the cache is cold, concurrency locks (`SemaphoreSlim`) prevent cache stampedes by ensuring only a single thread fetches data from Firebase while other concurrent requests wait for the populated cache.
 
-If given more time, I would implement a proactive background caching mechanism using an IHostedService or Background Worker to poll the Hacker News API every few minutes. This would keep the cache constantly warm, ensuring that every incoming API request is served in a few milliseconds without the initial lazy-loading latency spike for the first user. 
+At the network layer, outbound requests to Firebase are throttled using a `SemaphoreSlim` to avoid rate limiting and socket exhaustion. The underlying `SocketsHttpHandler` is explicitly configured to leverage HTTP/2 multiplexing and IPv4 fast-path resolution, reducing the cold-fetch time of 200 concurrent requests to ~2.5 seconds. Transient network failures are handled gracefully using Polly retry policies with exponential backoff.
 
-For a production environment with multiple instances running behind a load balancer, I would replace the in-memory cache with an IDistributedCache solution like Redis or the .NET HybridCache to share the cached stories across all nodes. I would also implement the ASP.NET Core native RateLimiter middleware to protect the endpoint from malicious abuse or excessive requests from single IP addresses. Lastly, I would integrate OpenTelemetry to expose metrics such as cache hit ratios and external API latency, along with structured logging for better production observability.
+For data mapping, the Hacker News API item model contains both a `kids` array (top-level comments only) and a `descendants` integer. This implementation assumes `commentCount` refers to the total number of comments in the thread and maps it from `descendants`. Text-only posts ("Ask HN") that do not contain an external URL have their `uri` mapped to an empty string.
+
+## Enhancements (Given More Time)
+
+For a multi-node production environment running behind a load balancer, I would replace `IMemoryCache` with a distributed caching layer such as Redis (`IDistributedCache` or .NET `HybridCache`) so that all instances share the pre-warmed story data without duplicating background polling to Hacker News.
+
+I would also implement the native ASP.NET Core `RateLimiter` middleware to protect our public endpoint from abuse or DDoS scenarios per client IP, and integrate OpenTelemetry for distributed tracing, structured logging (Serilog), and metrics exposition (cache hit/miss ratios and upstream Firebase latency) alongside `/health` readiness probes.

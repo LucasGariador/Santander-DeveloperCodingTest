@@ -1,25 +1,26 @@
-using Microsoft.Extensions.Caching.Memory;
-using Microsoft.Extensions.Options;
 using HackerNews.Api.Clients;
 using HackerNews.Api.Configuration;
 using HackerNews.Api.Models;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Options;
 
 namespace HackerNews.Api.Services;
 
 public interface IStoriesService
 {
     Task<IEnumerable<StoryDto>> GetBestStoriesAsync(int count, CancellationToken ct = default);
+    Task RefreshCacheAsync(CancellationToken ct = default);
 }
 
 public class StoriesService : IStoriesService
 {
-    private const string BestStoriesCacheKey = "BestStories_Ids";
+    private const string AllSortedStoriesCacheKey = "BestStories_AllSorted";
     private readonly IHackerNewsClient _hnClient;
     private readonly IMemoryCache _cache;
     private readonly ILogger<StoriesService> _logger;
     private readonly HackerNewsOptions _options;
-    
-    private static readonly SemaphoreSlim CacheLock = new(1, 1);
+
+    private static readonly SemaphoreSlim RefreshLock = new(1, 1);
     private readonly SemaphoreSlim _httpThrottle;
 
     public StoriesService(
@@ -37,7 +38,52 @@ public class StoriesService : IStoriesService
 
     public async Task<IEnumerable<StoryDto>> GetBestStoriesAsync(int count, CancellationToken ct = default)
     {
-        var storyIds = await GetBestStoryIdsCachedAsync(ct);
+        if (_cache.TryGetValue(AllSortedStoriesCacheKey, out List<StoryDto>? cachedList) && cachedList is not null)
+        {
+            return cachedList.Take(count);
+        }
+
+        await RefreshLock.WaitAsync(ct);
+        try
+        {
+            // Double-check lock pattern to prevent cache stampede when multiple requests wait on the semaphore
+            if (_cache.TryGetValue(AllSortedStoriesCacheKey, out cachedList) && cachedList is not null)
+            {
+                return cachedList.Take(count);
+            }
+
+            var sortedStories = await FetchAndSortAllBestStoriesAsync(ct);
+            _cache.Set(AllSortedStoriesCacheKey, sortedStories, TimeSpan.FromMinutes(_options.IdsCacheDurationMinutes));
+
+            return sortedStories.Take(count);
+        }
+        finally
+        {
+            RefreshLock.Release();
+        }
+    }
+
+    public async Task RefreshCacheAsync(CancellationToken ct = default)
+    {
+        await RefreshLock.WaitAsync(ct);
+        try
+        {
+            var sortedStories = await FetchAndSortAllBestStoriesAsync(ct);
+            if (sortedStories.Count > 0)
+            {
+                _cache.Set(AllSortedStoriesCacheKey, sortedStories, TimeSpan.FromMinutes(_options.IdsCacheDurationMinutes));
+                _logger.LogInformation("Hacker News cache warmed up successfully with {Count} stories.", sortedStories.Count);
+            }
+        }
+        finally
+        {
+            RefreshLock.Release();
+        }
+    }
+
+    private async Task<List<StoryDto>> FetchAndSortAllBestStoriesAsync(CancellationToken ct)
+    {
+        var storyIds = await _hnClient.GetBestStoryIdsAsync(ct);
         if (storyIds.Count == 0)
             return [];
 
@@ -48,28 +94,7 @@ public class StoriesService : IStoriesService
             .Where(s => s is not null)
             .Select(s => s!)
             .OrderByDescending(s => s.Score)
-            .Take(count);
-    }
-
-    private async Task<IReadOnlyList<int>> GetBestStoryIdsCachedAsync(CancellationToken ct)
-    {
-        if (_cache.TryGetValue(BestStoriesCacheKey, out IReadOnlyList<int>? cachedIds) && cachedIds is not null)
-            return cachedIds;
-
-        await CacheLock.WaitAsync(ct);
-        try
-        {
-            if (_cache.TryGetValue(BestStoriesCacheKey, out cachedIds) && cachedIds is not null)
-                return cachedIds;
-
-            var ids = await _hnClient.GetBestStoryIdsAsync(ct);
-            _cache.Set(BestStoriesCacheKey, ids, TimeSpan.FromMinutes(_options.IdsCacheDurationMinutes));
-            return ids;
-        }
-        finally
-        {
-            CacheLock.Release();
-        }
+            .ToList();
     }
 
     private async Task<StoryDto?> GetStoryDetailCachedAsync(int id, CancellationToken ct)
