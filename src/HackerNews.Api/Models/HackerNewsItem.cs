@@ -11,12 +11,3 @@ public record HackerNewsItem(
     [property: JsonPropertyName("score")] int Score,
     [property: JsonPropertyName("descendants")] int Descendants
 );
-
-public record StoryDto(
-    string Title,
-    string Uri,
-    string PostedBy,
-    DateTimeOffset Time,
-    int Score,
-    int CommentCount
-);
